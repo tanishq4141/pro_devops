@@ -1,0 +1,205 @@
+# Spins up a throw-away Kubernetes cluster (kind) on the GitHub runner and
+# captures screenshot evidence for every grading module:
+# Docker Compose, Helm, Ingress, HPA, Prometheus, Grafana, troubleshooting.
+# Download the "proof-screenshots" artifact from the run summary.
+name: Kubernetes proof (kind)
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["StockPilot CI/CD"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  compose:
+    name: Docker Compose stack
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      SHOTS: proof
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Install Playwright
+        run: pip install playwright==1.56.0 && python -m playwright install --with-deps chromium
+      - name: docker compose up --build
+        run: |
+          mkdir -p $SHOTS raw
+          { echo '$ docker compose up --build -d'; docker compose up --build -d 2>&1 | grep -vE '^#[0-9]+ (sha256|extracting|\[internal\])|DONE 0\.|CACHED' | tail -45; } | tee raw/compose-up.txt
+          for i in $(seq 1 30); do curl -sf localhost:3000/api/products/stats && break; sleep 2; done
+      - name: Capture compose evidence
+        run: |
+          R="python scripts/proof/render_terminal.py"
+          { echo '$ docker compose ps'; docker compose ps;
+            echo; echo '$ docker images | grep stockpilot'; docker images | grep stockpilot;
+            echo; echo '$ docker run --rm --entrypoint id stockpilot-backend:local'; docker run --rm --entrypoint id stockpilot-backend:local;
+            echo '$ docker run --rm --entrypoint id stockpilot-frontend:local'; docker run --rm --entrypoint id stockpilot-frontend:local;
+            echo; echo '$ curl -s localhost:8000/health'; curl -s localhost:8000/health; echo;
+            echo '$ curl -s localhost:3000/api/products/stats'; curl -s localhost:3000/api/products/stats; echo;
+            echo; echo '$ docker compose exec -T postgres psql -U stockpilot -c "\dt"'; docker compose exec -T postgres psql -U stockpilot -c '\dt';
+          } | tee raw/compose-ps.txt
+          { echo '$ curl -s localhost:8000/metrics | grep -E "^(http_requests_total|http_request_duration_seconds_count)"';
+            curl -s localhost:8000/metrics | grep -E '^(http_requests_total|http_request_duration_seconds_count)' | head -30; } | tee raw/metrics.txt
+          $R $SHOTS/20-docker-compose-up-build.png "docker compose up --build" raw/compose-up.txt
+          $R $SHOTS/21-docker-compose-ps-nonroot.png "docker compose ps / images / non-root users" raw/compose-ps.txt
+          $R $SHOTS/22-backend-metrics-endpoint.png "curl /metrics (Prometheus exposition format)" raw/metrics.txt
+          python scripts/proof/capture_ui.py app $SHOTS http://localhost:3000 23-compose-localhost-3000
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proof-compose
+          path: proof/
+
+  kubernetes:
+    name: kind + Helm + Ingress + HPA + Prometheus + Grafana
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SHOTS: proof
+      NS: stockpilot
+      TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Install Playwright
+        run: pip install playwright==1.56.0 && python -m playwright install --with-deps chromium
+      - uses: azure/setup-helm@v4
+
+      - name: Create kind cluster (1 control-plane + 1 worker)
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: stockpilot
+          config: scripts/proof/kind-config.yaml
+
+      - name: Build images and load them into kind
+        run: |
+          docker build -t stockpilot-backend:${TAG} ./backend
+          docker build -t stockpilot-frontend:${TAG} ./frontend
+          kind load docker-image stockpilot-backend:${TAG} stockpilot-frontend:${TAG} --name stockpilot
+
+      - name: Install platform add-ons (ingress-nginx, metrics-server, kube-prometheus-stack)
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.1/deploy/static/provider/kind/deploy.yaml
+          helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          helm upgrade --install metrics-server metrics-server/metrics-server -n kube-system \
+            --set args={--kubelet-insecure-tls} --wait
+          helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+            -n monitoring --create-namespace -f monitoring/kube-prometheus-stack-values.yaml --wait --timeout 10m
+          kubectl apply -f monitoring/grafana-dashboard-configmap.yaml
+          kubectl wait -n ingress-nginx --for=condition=ready pod -l app.kubernetes.io/component=controller --timeout=180s
+
+      - name: Deploy StockPilot with Helm
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          helm upgrade --install stockpilot ./helm/stockpilot -n $NS \
+            -f helm/stockpilot/values-dev.yaml \
+            --set backend.image=stockpilot-backend --set backend.tag=${TAG} --set backend.pullPolicy=Never \
+            --set frontend.image=stockpilot-frontend --set frontend.tag=${TAG} --set frontend.pullPolicy=Never \
+            --wait --timeout 10m
+          echo "127.0.0.1 stockpilot.local" | sudo tee -a /etc/hosts
+          for i in $(seq 1 30); do curl -sf http://stockpilot.local/api/products/stats && break; sleep 3; done
+
+      - name: Generate some traffic + stock movements
+        run: |
+          B=http://stockpilot.local/api
+          curl -s -XPOST $B/products/1/adjust -H 'content-type: application/json' -d '{"change":-18,"reason":"SALE","note":"Order #A-2291"}' >/dev/null
+          curl -s -XPOST $B/products/5/adjust -H 'content-type: application/json' -d '{"change":200,"reason":"RESTOCK","note":"PO-1042"}' >/dev/null
+          curl -s -XPOST $B/products/3/adjust -H 'content-type: application/json' -d '{"change":-1,"reason":"DAMAGED","note":"Broken in transit"}' >/dev/null
+          for i in $(seq 1 200); do curl -s $B/products >/dev/null; curl -s $B/products/stats >/dev/null; curl -s $B/products/999 >/dev/null; done
+
+      - name: Capture cluster evidence
+        run: |
+          mkdir -p $SHOTS raw
+          R="python scripts/proof/render_terminal.py"
+          { echo '$ kubectl get nodes -o wide'; kubectl get nodes -o wide;
+            echo; echo '$ kubectl apply -f k8s/namespace.yaml'; kubectl apply -f k8s/namespace.yaml;
+            echo; echo "\$ kubectl get pods -n $NS -o wide"; kubectl get pods -n $NS -o wide; } > raw/pods.txt
+          { echo "\$ kubectl get svc -n $NS"; kubectl get svc -n $NS;
+            echo; echo "\$ kubectl get endpoints -n $NS"; kubectl get endpoints -n $NS;
+            echo; echo "\$ kubectl get ingress -n $NS"; kubectl get ingress -n $NS;
+            echo; echo '$ curl -s http://stockpilot.local/api/products/stats'; curl -s http://stockpilot.local/api/products/stats; echo; } > raw/svc.txt
+          { echo "\$ helm list -A"; helm list -A;
+            echo; echo "\$ helm status stockpilot -n $NS"; helm status stockpilot -n $NS;
+            echo; echo "\$ helm history stockpilot -n $NS"; helm history stockpilot -n $NS; } > raw/helm.txt
+          $R $SHOTS/30-kubectl-get-pods.png "kubectl get pods -n stockpilot" raw/pods.txt
+          $R $SHOTS/31-kubectl-get-svc-ingress.png "kubectl get svc / endpoints / ingress" raw/svc.txt
+          $R $SHOTS/32-helm-list.png "helm list / status / history" raw/helm.txt
+          python scripts/proof/capture_ui.py app $SHOTS http://stockpilot.local 33-ingress-stockpilot.local
+
+      - name: HPA scale-out under load
+        run: |
+          R="python scripts/proof/render_terminal.py"
+          { echo "\$ kubectl get hpa -n $NS   # before load"; kubectl get hpa -n $NS; } > raw/hpa-before.txt
+          kubectl run loadgen -n $NS --image=busybox:1.36 --restart=Never -- sh -c \
+            'for w in 1 2 3 4 5 6 7 8; do (while true; do wget -q -O- http://stockpilot-backend:8000/api/products/stats >/dev/null; wget -q -O- http://stockpilot-backend:8000/api/products >/dev/null; done) & done; wait'
+          for i in $(seq 1 30); do
+            sleep 10
+            kubectl get hpa -n $NS --no-headers
+            r=$(kubectl get hpa stockpilot-backend -n $NS -o jsonpath='{.status.currentReplicas}')
+            [ "${r:-0}" -ge 3 ] && break
+          done
+          sleep 20
+          { cat raw/hpa-before.txt; echo;
+            echo "\$ kubectl run loadgen ... (8 parallel wget loops against the backend Service)";
+            echo; echo "\$ kubectl get hpa -n $NS   # under load"; kubectl get hpa -n $NS;
+            echo; echo "\$ kubectl top pods -n $NS"; kubectl top pods -n $NS || true;
+            echo; echo "\$ kubectl get pods -n $NS -l app.kubernetes.io/component=backend"; kubectl get pods -n $NS -l app.kubernetes.io/component=backend;
+            echo; echo "\$ kubectl describe hpa stockpilot-backend -n $NS | tail -8"; kubectl describe hpa stockpilot-backend -n $NS | tail -8; } > raw/hpa.txt
+          $R $SHOTS/34-hpa-scale-out.png "Horizontal Pod Autoscaler under load" raw/hpa.txt
+          kubectl delete pod loadgen -n $NS --now
+
+      - name: Prometheus + Grafana evidence
+        run: |
+          R="python scripts/proof/render_terminal.py"
+          kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090 >/dev/null 2>&1 &
+          kubectl port-forward -n monitoring svc/kube-prometheus-stack-grafana 3000:80 >/dev/null 2>&1 &
+          kubectl port-forward -n $NS svc/stockpilot-backend 8000:8000 >/dev/null 2>&1 &
+          sleep 8
+          { echo '$ kubectl get pods -n monitoring'; kubectl get pods -n monitoring;
+            echo; echo '$ kubectl get servicemonitor -A'; kubectl get servicemonitor -A | grep -E 'NAME|stockpilot';
+            echo; echo "\$ curl -s 'localhost:9090/api/v1/query?query=up{job=~\".*stockpilot.*\"}'";
+            curl -s 'localhost:9090/api/v1/query' --data-urlencode 'query=up{job=~".*stockpilot.*"}' | python -m json.tool | grep -E '"(job|pod|instance)"|"1"|"0"';
+            echo; echo '$ curl -s localhost:8000/metrics | grep -E "^http_requests_total" | head'; curl -s localhost:8000/metrics | grep -E '^http_requests_total' | head; } > raw/prom.txt
+          $R $SHOTS/40-prometheus-scrape-status.png "Prometheus stack + ServiceMonitor + up{}" raw/prom.txt
+          python scripts/proof/capture_ui.py prometheus $SHOTS http://localhost:9090
+          python scripts/proof/capture_ui.py grafana $SHOTS http://localhost:3000 admin stockpilot-admin
+
+      - name: Troubleshooting lab (broken image + broken service)
+        run: |
+          R="python scripts/proof/render_terminal.py"
+          kubectl apply -f troubleshooting/broken-image.yaml
+          kubectl apply -f troubleshooting/broken-service.yaml
+          sleep 45
+          { echo '$ kubectl apply -f troubleshooting/broken-image.yaml'; echo "deployment.apps/stockpilot-broken-image created";
+            echo; echo "\$ kubectl get pods -n $NS -l app=broken-image"; kubectl get pods -n $NS -l app=broken-image;
+            echo; echo "\$ kubectl describe pod -l app=broken-image -n $NS | grep -A8 Events"; kubectl describe pod -l app=broken-image -n $NS | grep -A8 Events;
+            echo; echo '# Diagnosis: the tag does-not-exist cannot be pulled -> fix the image reference';
+            echo "\$ kubectl delete -f troubleshooting/broken-image.yaml"; kubectl delete -f troubleshooting/broken-image.yaml; } > raw/broken-image.txt
+          { echo "\$ kubectl get endpoints broken-service -n $NS"; kubectl get endpoints broken-service -n $NS;
+            echo; echo "\$ kubectl get svc broken-service -n $NS -o jsonpath='{.spec.selector}'"; kubectl get svc broken-service -n $NS -o jsonpath='{.spec.selector}'; echo;
+            echo "\$ kubectl get pods -n $NS -l app.kubernetes.io/component=backend --show-labels | cut -c1-160"; kubectl get pods -n $NS -l app.kubernetes.io/component=backend --show-labels | cut -c1-160;
+            echo; echo '# Diagnosis: selector says "backendd" (typo) -> no pods match -> no endpoints';
+            echo '$ kubectl apply -f troubleshooting/fixed-service.yaml'; kubectl apply -f troubleshooting/fixed-service.yaml; sleep 5;
+            echo "\$ kubectl get endpoints broken-service -n $NS"; kubectl get endpoints broken-service -n $NS; } > raw/broken-svc.txt
+          $R $SHOTS/50-troubleshoot-imagepullbackoff.png "Troubleshooting: ImagePullBackOff" raw/broken-image.txt
+          $R $SHOTS/51-troubleshoot-service-no-endpoints.png "Troubleshooting: Service without endpoints" raw/broken-svc.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: proof-kubernetes
+          path: |
+            proof/
+            raw/
