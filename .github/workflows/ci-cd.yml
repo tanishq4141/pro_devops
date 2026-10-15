@@ -1,0 +1,223 @@
+name: StockPilot CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------- TEST ----
+  backend-test:
+    name: Backend tests (pytest + Alembic on PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: stockpilot
+          POSTGRES_USER: stockpilot
+          POSTGRES_PASSWORD: stockpilot
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U stockpilot" --health-interval 5s --health-timeout 3s --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run pytest (isolated SQLite test DB)
+        run: pytest -v --junitxml=pytest-report.xml
+      - name: Verify Alembic migrations against real PostgreSQL
+        env:
+          DATABASE_URL: postgresql+psycopg://stockpilot:stockpilot@localhost:5432/stockpilot
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+          alembic current
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pytest-report
+          path: backend/pytest-report.xml
+
+  frontend-build:
+    name: Frontend build (Vite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  iac-validate:
+    name: Helm lint + Terraform validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Helm lint and render
+        run: |
+          helm lint helm/stockpilot -f helm/stockpilot/values-dev.yaml
+          helm lint helm/stockpilot -f helm/stockpilot/values-prod.yaml
+          helm template stockpilot helm/stockpilot -n stockpilot -f helm/stockpilot/values-prod.yaml > /dev/null
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform fmt / init / validate
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+
+  # ------------------------------------------- BUILD + SECURITY SCAN + PUSH --
+  build-scan-push:
+    name: Build, Trivy scan, push to GHCR
+    needs: [backend-test, frontend-build, iac-validate]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image names (GHCR requires lowercase)
+        id: img
+        run: |
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "backend=${REGISTRY}/${owner}/stockpilot-backend:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "frontend=${REGISTRY}/${owner}/stockpilot-frontend:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build images (tagged with the commit SHA)
+        run: |
+          docker build -t "${{ steps.img.outputs.backend }}" ./backend
+          docker build -t "${{ steps.img.outputs.frontend }}" ./frontend
+          docker images | grep stockpilot
+
+      - name: Prove containers run as non-root
+        run: |
+          echo "backend user:  $(docker run --rm --entrypoint id '${{ steps.img.outputs.backend }}')"
+          echo "frontend user: $(docker run --rm --entrypoint id '${{ steps.img.outputs.frontend }}')"
+
+      # Full report (all severities) kept as an artifact for the write-up.
+      - name: Trivy report - backend
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 (pinned by SHA - see README security note)
+        with:
+          version: v0.69.3
+          image-ref: ${{ steps.img.outputs.backend }}
+          format: table
+          output: trivy-backend.txt
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"
+      - name: Trivy report - frontend
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 (pinned by SHA - see README security note)
+        with:
+          version: v0.69.3
+          image-ref: ${{ steps.img.outputs.frontend }}
+          format: table
+          output: trivy-frontend.txt
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
+      - name: Show Trivy reports
+        run: cat trivy-backend.txt trivy-frontend.txt
+
+      # Security gate: fail the pipeline on fixable HIGH/CRITICAL CVEs.
+      - name: Trivy gate - backend (HIGH,CRITICAL)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 (pinned by SHA - see README security note)
+        with:
+          version: v0.69.3
+          image-ref: ${{ steps.img.outputs.backend }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
+      - name: Trivy gate - frontend (HIGH,CRITICAL)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0 (pinned by SHA - see README security note)
+        with:
+          version: v0.69.3
+          image-ref: ${{ steps.img.outputs.frontend }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-reports
+          path: trivy-*.txt
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push images
+        run: |
+          docker push "${{ steps.img.outputs.backend }}"
+          docker push "${{ steps.img.outputs.frontend }}"
+          {
+            echo "### Images pushed"
+            echo "- \`${{ steps.img.outputs.backend }}\`"
+            echo "- \`${{ steps.img.outputs.frontend }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- DEPLOY --
+  # Enabled once the EKS cluster exists: set repository variable DEPLOY_TO_EKS=true
+  # and secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (see README Part I).
+  deploy-eks:
+    name: Deploy to EKS with Helm
+    needs: build-scan-push
+    if: github.ref == 'refs/heads/main' && vars.DEPLOY_TO_EKS == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
+      - uses: azure/setup-helm@v4
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER_NAME || 'stockpilot-eks' }}" --region "${{ vars.AWS_REGION || 'ap-south-1' }}"
+      - name: Helm upgrade --install
+        run: |
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          helm upgrade --install stockpilot ./helm/stockpilot \
+            --namespace stockpilot --create-namespace \
+            -f helm/stockpilot/values-prod.yaml \
+            --set backend.image=ghcr.io/${owner}/stockpilot-backend \
+            --set frontend.image=ghcr.io/${owner}/stockpilot-frontend \
+            --set backend.tag=${GITHUB_SHA} \
+            --set frontend.tag=${GITHUB_SHA} \
+            --wait --timeout 10m
+          kubectl get pods,svc,ingress,hpa -n stockpilot
