@@ -1,0 +1,19 @@
+# AWS EKS
+backend:
+  replicaCount: 2
+frontend:
+  replicaCount: 2
+postgres:
+  persistence:
+    size: 10Gi
+    storageClass: gp3
+ingress:
+  enabled: true
+  host: ""   # empty host = match any hostname (use the ingress-nginx ELB DNS name)
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 8
+monitoring:
+  serviceMonitor:
+    enabled: true

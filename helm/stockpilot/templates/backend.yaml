@@ -1,0 +1,74 @@
+{{- $name := printf "%s-backend" (include "stockpilot.fullname" .) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "stockpilot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  {{- if not .Values.hpa.enabled }}
+  replicas: {{ .Values.backend.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "stockpilot.selector" (dict "root" . "component" "backend") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "stockpilot.labels" . | nindent 8 }}
+        {{- include "stockpilot.selector" (dict "root" . "component" "backend") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      initContainers:
+        - name: wait-for-postgres
+          image: {{ .Values.postgres.image }}
+          command: ["sh", "-c", "until pg_isready -h {{ include "stockpilot.fullname" . }}-postgres -p 5432; do echo waiting for db; sleep 2; done"]
+      containers:
+        - name: backend
+          image: "{{ .Values.backend.image }}:{{ .Values.backend.tag }}"
+          imagePullPolicy: {{ .Values.backend.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: DB_USER
+              valueFrom: {secretKeyRef: {name: {{ include "stockpilot.fullname" . }}-postgres, key: username}}
+            - name: DB_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ include "stockpilot.fullname" . }}-postgres, key: password}}
+            - name: DATABASE_URL
+              value: {{ include "stockpilot.databaseUrl" . | quote }}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          securityContext:
+            allowPrivilegeEscalation: false
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "stockpilot.labels" . | nindent 4 }}
+    {{- include "stockpilot.selector" (dict "root" . "component" "backend") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "stockpilot.selector" (dict "root" . "component" "backend") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

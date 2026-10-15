@@ -1,0 +1,7 @@
+# Local / kind cluster
+ingress:
+  enabled: true
+  host: stockpilot.local
+monitoring:
+  serviceMonitor:
+    enabled: true

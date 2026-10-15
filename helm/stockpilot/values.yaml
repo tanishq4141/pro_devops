@@ -1,0 +1,47 @@
+# Default values for the StockPilot chart.
+imagePullSecrets: []
+
+backend:
+  image: ghcr.io/YOUR_GITHUB_USER/stockpilot-backend
+  tag: latest            # CI overrides this with the Git commit SHA
+  pullPolicy: IfNotPresent
+  replicaCount: 2
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 384Mi}
+
+frontend:
+  image: ghcr.io/YOUR_GITHUB_USER/stockpilot-frontend
+  tag: latest
+  pullPolicy: IfNotPresent
+  replicaCount: 2
+  resources:
+    requests: {cpu: 25m, memory: 32Mi}
+    limits: {cpu: 200m, memory: 128Mi}
+
+postgres:
+  image: postgres:16-alpine
+  database: stockpilot
+  username: stockpilot
+  password: stockpilot   # demo only - override with --set or an external secret in real environments
+  persistence:
+    size: 2Gi
+    storageClass: ""     # "" = cluster default (gp3 on EKS, standard on kind)
+
+ingress:
+  enabled: false
+  className: nginx
+  host: stockpilot.local
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 60
+
+monitoring:
+  serviceMonitor:
+    enabled: false
+    # must match the Helm release name of kube-prometheus-stack
+    releaseLabel: kube-prometheus-stack
+    interval: 15s
