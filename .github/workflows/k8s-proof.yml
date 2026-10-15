@@ -22,10 +22,10 @@ jobs:
     env:
       SHOTS: proof
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with: {python-version: "3.12"}
       - name: Install Playwright
         run: pip install playwright==1.56.0 && python -m playwright install --with-deps chromium
@@ -51,7 +51,7 @@ jobs:
           $R $SHOTS/21-docker-compose-ps-nonroot.png "docker compose ps / images / non-root users" raw/compose-ps.txt
           $R $SHOTS/22-backend-metrics-endpoint.png "curl /metrics (Prometheus exposition format)" raw/metrics.txt
           python scripts/proof/capture_ui.py app $SHOTS http://localhost:3000 23-compose-localhost-3000
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: proof-compose
           path: proof/
@@ -66,10 +66,10 @@ jobs:
       NS: stockpilot
       TAG: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with: {python-version: "3.12"}
       - name: Install Playwright
         run: pip install playwright==1.56.0 && python -m playwright install --with-deps chromium
@@ -196,7 +196,7 @@ jobs:
           $R $SHOTS/50-troubleshoot-imagepullbackoff.png "Troubleshooting: ImagePullBackOff" raw/broken-image.txt
           $R $SHOTS/51-troubleshoot-service-no-endpoints.png "Troubleshooting: Service without endpoints" raw/broken-svc.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: proof-kubernetes

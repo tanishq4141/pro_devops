@@ -7,6 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Pick up the latest Debian security fixes for the base image.
+RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
+ && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first so this layer is cached between code changes.
 COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel \
