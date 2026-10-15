@@ -1,0 +1,16 @@
+# LAB 2 - Service with no endpoints
+# kubectl apply -f troubleshooting/broken-service.yaml
+# kubectl get endpoints broken-service -n stockpilot      -> <none>
+# kubectl get pods -n stockpilot --show-labels            -> compare labels with the selector
+# Fix: kubectl apply -f troubleshooting/fixed-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: broken-service
+  namespace: stockpilot
+spec:
+  selector:
+    app.kubernetes.io/component: backendd   # typo - matches no pod
+  ports:
+    - port: 8000
+      targetPort: 8000

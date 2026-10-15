@@ -1,0 +1,21 @@
+# LAB 1 - ImagePullBackOff
+# kubectl apply -f troubleshooting/broken-image.yaml
+# kubectl get pods -n stockpilot            -> ErrImagePull / ImagePullBackOff
+# kubectl describe pod -l app=broken-image -n stockpilot   -> "manifest unknown"/"not found"
+# Fix: point the image at a tag that exists, or delete the Deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stockpilot-broken-image
+  namespace: stockpilot
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: broken-image}
+  template:
+    metadata:
+      labels: {app: broken-image}
+    spec:
+      containers:
+        - name: backend
+          image: ghcr.io/example/stockpilot-backend:does-not-exist
