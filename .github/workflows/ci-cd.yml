@@ -192,7 +192,7 @@ jobs:
 
   # ---------------------------------------------------------------- DEPLOY --
   # Enabled once the EKS cluster exists: set repository variable DEPLOY_TO_EKS=true
-  # and secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (see README Part I).
+  # and secrets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (see README Part F).
   deploy-eks:
     name: Deploy to EKS with Helm
     needs: build-scan-push

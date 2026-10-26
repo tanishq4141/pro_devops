@@ -13,9 +13,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies first so this layer is cached between code changes.
+# pip is removed afterwards: it is not needed at runtime and its vendored copies of
+# msgpack/urllib3/pkg_resources carry fixable HIGH CVEs that fail the Trivy gate.
 COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel \
  && pip install -r requirements.txt \
+ && pip uninstall -y pip \
+ && rm -rf /usr/local/lib/python3.12/ensurepip \
  && useradd --create-home --uid 10001 appuser
 
 COPY alembic.ini ./
